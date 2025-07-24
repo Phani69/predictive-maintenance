@@ -7,4 +7,4 @@ scipy
 imblearn
 xgboost
 shap
-tqdm
+tqdm# predictive-maintenance
