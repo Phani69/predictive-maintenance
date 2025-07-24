@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Predictive Maintenance GUI</title>
+    <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/babel-standalone@7/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/pyodide/0.25.1/full/pyodide.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        function App() {
+            const [file, setFile] = React.useState(null);
+            const [prediction, setPrediction] = React.useState(null);
+            const [shapPlot, setShapPlot] = React.useState(null);
+            const [error, setError] = React.useState(null);
+            const [loading, setLoading] = React.useState(false);
+            const [pyodideReady, setPyodideReady] = React.useState(false);
+
+            // Initialize Pyodide and load Python dependencies
+            React.useEffect(() => {
+                async function initPyodide() {
+                    try {
+                        console.log("Loading Pyodide...");
+                        window.pyodide = await loadPyodide();
+                        console.log("Pyodide loaded. Loading packages...");
+                        await window.pyodide.loadPackage(['pandas', 'numpy', 'scikit-learn', 'joblib', 'shap', 'matplotlib']);
+                        console.log("Packages loaded. Setting up Python functions...");
+                        
+                        await window.pyodide.runPythonAsync(`
+                            import pandas as pd
+                            import numpy as np
+                            from scipy.fft import fft, fftfreq
+                            import joblib
+                            import shap
+                            import base64
+                            import io
+                            import matplotlib.pyplot as plt
+                            from pyodide.http import pyfetch
+
+                            def extract_features(data, window_size=1000):
+                                sensor_columns = [col for col in data.columns if isinstance(col, int)]
+                                feature_list = []
+                                for idx in range(0, len(data) - window_size, window_size):
+                                    window_data = data.iloc[idx:idx + window_size]
+                                    if len(window_data) < window_size:
+                                        continue
+                                    window_features = {}
+                                    for col in sensor_columns:
+                                        signal = window_data[col].values
+                                        window_features[f'ch{col}_mean'] = np.mean(signal)
+                                        window_features[f'ch{col}_rms'] = np.sqrt(np.mean(signal**2))
+                                        fft_vals = fft(signal)
+                                        freqs = fftfreq(len(signal), 1/1000)
+                                        magnitude = np.abs(fft_vals)
+                                        window_features[f'ch{col}_fft_low'] = magnitude[(freqs >= 0) & (freqs < 100)].sum()
+                                    feature_list.append(window_features)
+                                return pd.DataFrame(feature_list)
+
+                            async def predict_and_explain(file_content, model_path='models/trained_model.pkl', scaler_path='models/scaler.pkl'):
+                                try:
+                                    # Fetch model and scaler from the server
+                                    model_response = await pyfetch(model_path)
+                                    model_bytes = await model_response.bytes()
+                                    model = joblib.load(io.BytesIO(model_bytes))
+
+                                    scaler_response = await pyfetch(scaler_path)
+                                    scaler_bytes = await scaler_response.bytes()
+                                    scaler = joblib.load(io.BytesIO(scaler_bytes))
+                                    
+                                    # Read and process data
+                                    data = pd.read_csv(io.StringIO(file_content), sep=' ', header=None)
+                                    features_df = extract_features(data)
+                                    if features_df.empty:
+                                        return None, None, "No features extracted. Check file format or content length."
+                                    
+                                    # Scale features
+                                    feature_cols = list(features_df.columns)
+                                    X_scaled = scaler.transform(features_df[feature_cols])
+                                    
+                                    # Predict
+                                    predictions = model.predict(X_scaled)
+                                    prediction = 'Faulty' if predictions[0] == 1 else 'Healthy'
+                                    
+                                    # SHAP explanation
+                                    X_shap = shap.sample(X_scaled, 50) if len(X_scaled) > 50 else X_scaled
+                                    explainer = shap.TreeExplainer(model) if hasattr(model, 'feature_importances_') else shap.KernelExplainer(model.predict_proba, X_shap)
+                                    shap_values = explainer.shap_values(X_scaled)
+                                    shap_values_pos = shap_values[1] if isinstance(shap_values, list) else shap_values
+                                    
+                                    # Generate SHAP plot
+                                    plt.figure()
+                                    shap.summary_plot(shap_values_pos, features=X_scaled, feature_names=feature_cols, show=False)
+                                    buf = io.BytesIO()
+                                    plt.savefig(buf, format='png', bbox_inches='tight')
+                                    plt.close()
+                                    buf.seek(0)
+                                    shap_plot = base64.b64encode(buf.getvalue()).decode('utf-8')
+                                    
+                                    return prediction, shap_plot, None
+                                except Exception as e:
+                                    return None, None, str(e)
+                        `);
+                        console.log("Python environment ready.");
+                        setPyodideReady(true);
+                    } catch (err) {
+                        setError("Failed to initialize Pyodide environment. " + err);
+                    }
+                }
+                initPyodide();
+            }, []);
+
+            const handleFileUpload = async (e) => {
+                setLoading(true);
+                setError(null);
+                setPrediction(null);
+                setShapPlot(null);
+                const uploadedFile = e.target.files[0];
+                setFile(uploadedFile);
+                
+                if (uploadedFile) {
+                    const reader = new FileReader();
+                    reader.onload = async (event) => {
+                        const fileContent = event.target.result;
+                        // Safely pass file content to Pyodide
+                        window.pyodide.globals.set("file_content_js", fileContent);
+                        try {
+                            const result = await window.pyodide.runPythonAsync(`
+                                await predict_and_explain(file_content_js)
+                            `);
+                            const [predictionRes, shapPlotRes, errorRes] = result.toJs({ default_converter: Object.fromEntries });
+                            setPrediction(predictionRes);
+                            setShapPlot(shapPlotRes);
+                            setError(errorRes);
+                        } catch (err) {
+                            setError("An error occurred during Python execution: " + err);
+                        } finally {
+                            setLoading(false);
+                        }
+                    };
+                    reader.readAsText(uploadedFile);
+                } else {
+                    setLoading(false);
+                }
+            };
+
+            return (
+                <div className="min-h-screen bg-gray-100 flex flex-col items-center p-4">
+                    <h1 className="text-3xl font-bold mb-6 text-gray-800">Predictive Maintenance GUI</h1>
+                    <div className="bg-white p-6 rounded-lg shadow-lg w-full max-w-2xl">
+                        <h2 className="text-xl font-semibold mb-4 text-gray-700">Upload Sensor Data File</h2>
+                        {!pyodideReady && !error && (
+                             <div className="text-center p-4 bg-blue-100 text-blue-700 rounded-md">
+                                <p>Initializing Python Environment... Please wait.</p>
+                             </div>
+                        )}
+                        {pyodideReady && (
+                            <input
+                                type="file"
+                                accept=".txt,.csv"
+                                onChange={handleFileUpload}
+                                className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-violet-50 file:text-violet-700 hover:file:bg-violet-100"
+                            />
+                        )}
+                        
+                        {loading && <p className="text-blue-500 mt-4">Processing...</p>}
+                        {error && <p className="text-red-500 mt-4 font-mono bg-red-100 p-3 rounded"><b>Error:</b> {error}</p>}
+                        
+                        {prediction && (
+                            <div className="mt-6 border-t pt-4">
+                                <p className="text-xl font-semibold text-gray-800">Prediction Result:</p>
+                                <p className={`text-2xl font-bold ${prediction === 'Faulty' ? 'text-red-600' : 'text-green-600'}`}>
+                                    {prediction}
+                                </p>
+                            </div>
+                        )}
+                        {shapPlot && (
+                            <div className="mt-6 border-t pt-4">
+                                <h3 className="text-xl font-semibold text-gray-800">Feature Importance (SHAP)</h3>
+                                <p className="text-sm text-gray-600 mb-2">This plot shows the impact of each feature on the model's prediction.</p>
+                                <img src={`data:image/png;base64,${shapPlot}`} alt="SHAP Summary Plot" className="w-full rounded-md border" />
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>

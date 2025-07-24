@@ -1,0 +1,13 @@
+#source venv/bin/activate
+
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+scipy
+imblearn
+xgboost
+shap
+tqdm
+patool
